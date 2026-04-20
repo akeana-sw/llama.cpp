@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -26,7 +27,7 @@
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s \\\n"
-            "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--no-ppl] \\\n"
+            "       -m model.gguf -f some-text.txt [-o imatrix.gguf] [--output-format {gguf,dat}] [--no-ppl] \\\n"
             "       [--process-output] [--chunk 123] [--save-frequency 0] [--output-frequency 10] \\\n"
             "       [--in-file imatrix-prev-0.gguf --in-file imatrix-prev-1.gguf ...] [--parse-special] \\\n"
             "       [--show-statistics] [...]\n" , argv[0]);
@@ -142,9 +143,18 @@ static void compute_statistics(std::vector<tensor_statistics> & tstats, const st
     activations.reserve(e.values.size());
 
     for (int i = 0; i < n_mat; ++i) {
+        if (e.counts[i] == 0) {
+            LOG_DBG("%s: skipping tensor %s due to zero count at index %d\n", __func__, name.c_str(), i);
+            continue;
+        }
         for (int j = 0; j < row_size; ++j) {
             activations.push_back(e.values[i*row_size + j] / e.counts[i]);
         }
+    }
+
+    if (activations.empty()) {
+        LOG_ERR("%s: all counts are zero for tensor %s, skipping statistics computation\n", __func__, name.c_str());
+        return;
     }
 
     const float act_total     = std::accumulate(activations.begin(), activations.end(), 0.0f);
@@ -250,13 +260,6 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
     const char * data = is_host ? (const char *) src1->data : m_src1_data.data();
     GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
 
-    // TODO: 4d? (is that even used in practice?)
-    // the extra dimension would need to be stored somewhere to be reflected in the imatrix file
-    if (ggml_nrows(src1) != src1->ne[1] * src1->ne[2]) {
-        LOG_ERR("%s: tensor has more than 3 dimensions: %s", __func__, wname.c_str());
-        GGML_ASSERT(false);
-    }
-
     // this has been adapted to the new format of storing merged experts in a single 3d tensor
     // ref: https://github.com/ggml-org/llama.cpp/pull/6387
     if (t->op == GGML_OP_MUL_MAT_ID) {
@@ -271,6 +274,12 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         // take into account that ids is not contiguous!
 
         GGML_ASSERT(ids->ne[1] == src1->ne[2]);
+
+        // the extra dimension would need to be stored somewhere to be reflected in the imatrix file
+        if (ggml_nrows(src1) != src1->ne[1] * src1->ne[2]) {
+            LOG_ERR("%s: tensor has more than 3 dimensions: %s", __func__, wname.c_str());
+            GGML_ASSERT(false);
+        }
 
         m_ids.resize(ggml_nbytes(ids));
         ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
@@ -335,29 +344,40 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
         }
     } else {
         auto & e = m_stats[wname];
-        const int64_t n_mat = src1->ne[2] * src1->ne[3];
+        const int64_t n_mat = src0->ne[2] * src0->ne[3];
 
+        // use a single count per dense tensor
+        // (necessary when merging older GGUF-imatrix files with 3d tensors)
+        if (e.counts.size() > 1) {
+            bool all_equal = true;
+            for (size_t i = 1; i < e.counts.size(); ++i) {
+                if (e.counts[0] != e.counts[i]) {
+                    all_equal = false;
+                    break;
+                }
+            }
+            if (all_equal) {
+                e.counts.resize(1);
+            }
+        }
         if (e.values.empty()) {
             e.values.resize(src1->ne[0] * n_mat, 0);
-            e.counts.resize(n_mat, 0);
+            e.counts.resize(1, 0);
         }
         else if (e.values.size() != (size_t)(src1->ne[0] * n_mat)) {
             LOG_ERR("%s: inconsistent size for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.values.size(), (int)(src1->ne[0] * n_mat));
             exit(1); //GGML_ABORT("fatal error");
         }
-        else if (e.counts.size() != (size_t)n_mat) {
-            LOG_ERR("%s: inconsistent expert count for %s (%d vs %d)\n", __func__, wname.c_str(), (int)e.counts.size(), (int)n_mat);
-            exit(1); //GGML_ABORT("fatal error");
-        }
         LOG_DBGV(2, "%s[%d]: %32s, %s, %5d x %5d x %5d, %d\n", __func__, m_last_chunk, wname.c_str(), ggml_op_name(t->op), (int)src1->ne[0], (int)src1->ne[1], (int)src1->ne[2], (int)src1->type);
+
         for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
             for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
-                const int64_t mat_id = i3 * src1->ne[2] + i2;
+                // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
+                const int64_t mat_id = (i3 % src0->ne[3]) * src0->ne[2] + (i2 % src0->ne[2]);
                 const int64_t mat_start = mat_id * src1->ne[0];
 
                 for (int64_t row = 0; row < src1->ne[1]; ++row) {
-                    const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->ne[3]);
-                    e.counts[mat_id]++;
+                    const float * x = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
                     for (int64_t j = 0; j < src1->ne[0]; ++j) {
                         e.values[mat_start + j] += x[j] * x[j];
                         if (!std::isfinite((float)e.values[j])) {
@@ -366,16 +386,20 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
                         }
                     }
                 }
-                const int32_t n_chunk = e.counts[mat_id] / chunk_size;
-                if (n_chunk > m_last_chunk) {
-                    const int32_t chunk_step = n_chunk - m_last_chunk;
-                    m_last_chunk = n_chunk;
-                    if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
-                        save_imatrix();
-                    }
-                    if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
-                        save_imatrix(m_last_chunk);
-                    }
+            }
+        }
+        // only 1 count in practice, except when a tensor is used for both MUL_MAT_ID and MUL_MAT
+        for (size_t i = 0; i < e.counts.size(); ++i) {
+            e.counts[i] += ggml_nrows(src1) / n_mat;
+            const int32_t n_chunk = e.counts[i] / chunk_size;
+            if (n_chunk > m_last_chunk) {
+                const int32_t chunk_step = n_chunk - m_last_chunk;
+                m_last_chunk = n_chunk;
+                if ((m_last_chunk % m_params.n_out_freq) / chunk_step == 0) {
+                    save_imatrix();
+                }
+                if (m_params.n_save_freq > 0 && (m_last_chunk % m_params.n_save_freq) / chunk_step == 0) {
+                    save_imatrix(m_last_chunk);
                 }
             }
         }
@@ -492,12 +516,16 @@ void IMatrixCollector::save_imatrix_legacy(int32_t ncall) const {
 
 void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
     auto fname = m_params.out_file;
+    int8_t use_legacy_format = m_params.imat_dat;
 
-    // TODO: use the new format in more cases
-    if (!string_ends_with(fname, ".gguf")) {
-        LOG_WRN("\n%s: saving to legacy imatrix format because output suffix is not .gguf\n", __func__);
+    if (use_legacy_format > 0) {
         this->save_imatrix_legacy(n_chunk);
         return;
+    }
+    // only warn when `--output-format gguf` is not specified
+    if (use_legacy_format == 0 && !string_ends_with(fname, ".gguf")) {
+        LOG_WRN("\n%s: saving imatrix using GGUF format with a different suffix than .gguf\n", __func__);
+        LOG_WRN("%s: if you want the previous imatrix format, use --output-format dat\n", __func__);
     }
 
     if (n_chunk > 0) {
@@ -894,7 +922,9 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
-    GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+    if (llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_LAST) {
+        GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+    }
 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
@@ -1121,10 +1151,12 @@ static bool show_statistics(const common_params & params) {
             blk = -1;  // not a block layer
         }
 
+        const float entropy_norm = (tstat.elements > 0) ? 100.0f * (tstat.entropy / std::log2(tstat.elements)) : 0.0f;
+
         LOG_INF("%5s\t%-20s\t%10.2f\t%8.4f\t%11.4f\t%6.2f\t%6.2f\t%8.2f%%\t%6d\t%10.4f\t%6.2f%%\t%10.2f%%\t%8.4f\n",
                 layer.c_str(), name.c_str(), tstat.total_sqract, tstat.min_sqract, tstat.max_sqract, tstat.mean_sqract,
                 tstat.stddev, tstat.active * 100.0f, tstat.elements, tstat.entropy,
-                100.0f * (tstat.entropy / std::log2(tstat.elements)), 100.0f * tstat.zd, tstat.cossim);
+                entropy_norm, 100.0f * tstat.zd, tstat.cossim);
 
         const float weighted_bias   = tstat.elements * tstat.total_sqract;
         const float weighted_zd     = tstat.elements * tstat.zd;
@@ -1171,12 +1203,16 @@ static bool show_statistics(const common_params & params) {
 }
 
 int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
     common_params params;
 
     params.out_file = "imatrix.gguf";
 
     params.n_ctx = 512;
     params.escape = false;
+
+    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
         return 1;
@@ -1188,8 +1224,6 @@ int main(int argc, char ** argv) {
         }
         return 0;
     }
-
-    common_init();
 
     const int32_t n_ctx = params.n_ctx;
 
@@ -1247,10 +1281,10 @@ int main(int argc, char ** argv) {
     params.warmup = false;
 
     // init
-    common_init_result llama_init = common_init_from_params(params);
+    auto llama_init = common_init_from_params(params);
 
-    llama_model * model = llama_init.model.get();
-    llama_context * ctx = llama_init.context.get();
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
 
     if (model == nullptr || ctx == nullptr) {
         LOG_ERR("%s : failed to init\n", __func__);
